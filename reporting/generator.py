@@ -267,7 +267,17 @@ def generate_report(project, client, firm, findings, output_path):
         plt.savefig(chart_path, dpi=150)
         plt.close(fig)
         
-        chart_html = f'<div style="text-align: center; margin: 40px 0; page-break-inside: avoid;"><img src="file://{os.path.abspath(chart_path)}" style="max-width: 600px; width: 100%;"></div>'
+        # Embed the chart as a data: URI. Reports are written to reports/, which the
+        # restricted url_fetcher deliberately does not allow, so a file:// link to the
+        # chart would be blocked and the chart silently dropped from the PDF.
+        import base64
+        with open(chart_path, 'rb') as chart_file:
+            chart_b64 = base64.b64encode(chart_file.read()).decode('ascii')
+        try:
+            os.remove(chart_path)
+        except OSError:
+            pass
+        chart_html = f'<div style="text-align: center; margin: 40px 0; page-break-inside: avoid;"><img src="data:image/png;base64,{chart_b64}" style="max-width: 600px; width: 100%;"></div>'
         project['findings_chart'] = chart_html
         
         detailed_findings_md = """
