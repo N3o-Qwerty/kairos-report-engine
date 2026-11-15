@@ -45,6 +45,8 @@ llm_chats/
 ai_outputs/followup_fixes.patch
 followup_fixes.patch
 certs/
+*.pem
+*.key
 *.zip
 *.log
 
