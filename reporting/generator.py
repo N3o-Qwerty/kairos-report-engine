@@ -4,6 +4,31 @@ import markdown
 from jinja2 import Environment, FileSystemLoader
 from jinja2.sandbox import SandboxedEnvironment
 from weasyprint import HTML
+from urllib.parse import urlparse, unquote
+from weasyprint import default_url_fetcher
+
+
+def _safe_url_fetcher(allowed_root):
+    """Restrict WeasyPrint resource loading: allow only data: URIs and local files
+    under `allowed_root` (the app's own data dir, for charts/assets). Blocks all
+    http/https (SSRF) and any file:// outside the data dir (LFI) — covering CSS
+    url()/@import/<link> vectors a src="file://" regex misses."""
+    allowed_root = os.path.realpath(allowed_root)
+
+    def _fetch(url, *args, **kwargs):
+        if url.startswith("data:"):
+            return default_url_fetcher(url, *args, **kwargs)
+        parsed = urlparse(url)
+        if parsed.scheme in ("http", "https", "ftp"):
+            raise ValueError(f"Blocked remote resource during report render (SSRF): {url[:100]}")
+        if parsed.scheme in ("file", ""):
+            path = os.path.realpath(unquote(parsed.path))
+            if path == allowed_root or path.startswith(allowed_root + os.sep):
+                return default_url_fetcher(url, *args, **kwargs)
+            raise ValueError(f"Blocked local file outside data dir (LFI): {url[:100]}")
+        raise ValueError(f"Blocked URL scheme during report render: {parsed.scheme}")
+
+    return _fetch
 import logging
 
 from datetime import datetime
@@ -36,6 +61,12 @@ def generate_report(project, client, firm, findings, output_path):
         safe_type = project.get('project_type', '').replace(' ', '_').replace('/', '_')
         custom_template_path = os.path.join(template_dir, f'report_template_{safe_type}.md')
         default_template_path = os.path.join(template_dir, 'report_template.md')
+
+        # CWE-22 defense: verify resolved path stays within templates/
+        template_root = os.path.realpath(template_dir)
+        real_custom = os.path.realpath(custom_template_path)
+        if not (real_custom.startswith(template_root + os.sep) or real_custom == template_root):
+            raise ValueError("Security error: template path escapes templates/ directory")
         
         if os.path.exists(custom_template_path):
             md_template_path = custom_template_path
@@ -236,7 +267,17 @@ def generate_report(project, client, firm, findings, output_path):
         plt.savefig(chart_path, dpi=150)
         plt.close(fig)
         
-        chart_html = f'<div style="text-align: center; margin: 40px 0; page-break-inside: avoid;"><img src="file://{os.path.abspath(chart_path)}" style="max-width: 600px; width: 100%;"></div>'
+        # Embed the chart as a data: URI. Reports are written to reports/, which the
+        # restricted url_fetcher deliberately does not allow, so a file:// link to the
+        # chart would be blocked and the chart silently dropped from the PDF.
+        import base64
+        with open(chart_path, 'rb') as chart_file:
+            chart_b64 = base64.b64encode(chart_file.read()).decode('ascii')
+        try:
+            os.remove(chart_path)
+        except OSError:
+            pass
+        chart_html = f'<div style="text-align: center; margin: 40px 0; page-break-inside: avoid;"><img src="data:image/png;base64,{chart_b64}" style="max-width: 600px; width: 100%;"></div>'
         project['findings_chart'] = chart_html
         
         detailed_findings_md = """
@@ -377,7 +418,8 @@ def generate_report(project, client, firm, findings, output_path):
 
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         project_root = os.path.dirname(os.path.dirname(__file__))
-        HTML(string=final_html, base_url=project_root).write_pdf(output_path)
+        _fetcher = _safe_url_fetcher(os.path.join(project_root, "data"))
+        HTML(string=final_html, base_url=project_root, url_fetcher=_fetcher).write_pdf(output_path)
         
         logger.info(f"Successfully generated PDF report at {output_path}")
         return True
@@ -392,6 +434,12 @@ def get_rendered_attestation_markdown(project, client, firm, custom_bio=None, cu
     else:
         template_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'templates')
         md_template_path = os.path.join(template_dir, 'attestation_template.md')
+
+        # CWE-22 defense: verify resolved path stays within templates/
+        template_root = os.path.realpath(template_dir)
+        real_path = os.path.realpath(md_template_path)
+        if not (real_path.startswith(template_root + os.sep) or real_path == template_root):
+            raise ValueError("Security error: template path escapes templates/ directory")
         
         with open(md_template_path, 'r', encoding='utf-8') as f:
             md_content = f.read()
@@ -449,7 +497,8 @@ def generate_attestation(project, client, firm, output_path, custom_bio=None):
         final_html = html_template.render(content=report_html_body, firm=firm_dict, project=project, client=client, base_dir=project_root)
 
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        HTML(string=final_html, base_url=project_root).write_pdf(output_path)
+        _fetcher = _safe_url_fetcher(os.path.join(project_root, "data"))
+        HTML(string=final_html, base_url=project_root, url_fetcher=_fetcher).write_pdf(output_path)
         
         logger.info(f"Successfully generated Attestation Letter at {output_path}")
         return True
